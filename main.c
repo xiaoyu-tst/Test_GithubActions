@@ -60,7 +60,7 @@ int main()
 
    printf(" Data22Bits is 0x%x  %d \r\n",Data22Bits, Data22Bits);
 
-   if(data[3]>0)   printf("data[3]>0\r\n")
+   if(data[3]>0)     printf("data[3]>0\r\n")
 
     return 0;
 }
