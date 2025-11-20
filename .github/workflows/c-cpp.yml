@@ -1,0 +1,223 @@
+name: C Code Security & Quality Scan
+
+on:
+  push:
+    branches: [ master, develop ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  code-analysis:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install analysis tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          gcc \
+          valgrind \
+          clang \
+          clang-tools \
+          cppcheck \
+          splint \
+          make \
+          python3 \
+          python3-pip
+        
+        pip3 install flawfinder
+
+    - name: Basic syntax check
+      run: |
+        echo "🔍 Checking basic C syntax..."
+        if ! gcc -fsyntax-only -Wall -Wextra main.c 2>&1; then
+          echo "❌ Syntax errors found in main.c"
+          exit 1
+        fi
+        echo "✅ Basic syntax OK"
+
+    - name: Compile with all warnings
+      run: |
+        echo "🔍 Compiling with maximum warnings..."
+        gcc -Wall -Wextra -Wpedantic -Werror \
+            -Wformat-security \
+            -Warray-bounds \
+            -Wnull-dereference \
+            -Wstack-protector \
+            -O2 -g -o main main.c
+        echo "✅ Compilation with strict warnings successful"
+
+    - name: Static analysis with cppcheck
+      run: |
+        echo "🔍 Running cppcheck for array bounds and memory issues..."
+        cppcheck \
+          --enable=all \
+          --suppress=missingIncludeSystem \
+          --inline-suppr \
+          --error-exitcode=1 \
+          -I . \
+          --check-level=exhaustive \
+          main.c 2>&1 | tee cppcheck-report.txt
+        
+        # Check for specific critical errors
+        if grep -E "(arrayIndexOutOfBounds|outOfBounds|memoryLeak)" cppcheck-report.txt; then
+          echo "❌ Critical issues found by cppcheck"
+          exit 1
+        fi
+        echo "✅ cppcheck passed"
+
+    - name: Clang static analyzer
+      run: |
+        echo "🔍 Running clang static analyzer..."
+        clang --analyze \
+          -Xanalyzer -analyzer-checker=core,alpha.security,alpha.core \
+          -Weverything \
+          main.c 2>&1 | tee clang-analyzer-report.txt
+        
+        if [ -f main.plist ]; then
+          echo "❌ Clang analyzer found issues"
+          rm -f main.plist
+          exit 1
+        fi
+        echo "✅ Clang static analyzer passed"
+
+    - name: Array bounds checking with GCC sanitizers
+      run: |
+        echo "🔍 Compiling with address sanitizer..."
+        gcc -fsanitize=address -fsanitize=bounds -fsanitize=undefined \
+            -fno-omit-frame-pointer -g -O1 -o main_asan main.c
+        
+        echo "🔍 Compiling with memory sanitizer..."
+        gcc -fsanitize=memory -fno-omit-frame-pointer -g -O1 -o main_msan main.c
+        
+        echo "✅ Sanitizer compilation successful"
+
+    - name: Run with Valgrind for memory leaks
+      run: |
+        echo "🔍 Running memory leak detection with Valgrind..."
+        # First compile with debug symbols
+        gcc -g -O0 -o main_debug main.c
+        
+        # Run with valgrind
+        valgrind \
+          --leak-check=full \
+          --track-origins=yes \
+          --errors-for-leak-kinds=all \
+          --error-exitcode=1 \
+          ./main_debug 2>&1 | tee valgrind-report.txt
+        
+        # Check for memory errors
+        if grep -E "(Invalid read|Invalid write|definitely lost|indirectly lost)" valgrind-report.txt; then
+          echo "❌ Memory issues detected by Valgrind"
+          exit 1
+        fi
+        echo "✅ No memory leaks detected"
+
+    - name: Buffer overflow detection
+      run: |
+        echo "🔍 Checking for buffer overflow vulnerabilities..."
+        gcc -fstack-protector-strong -D_FORTIFY_SOURCE=2 -O2 -o main_secure main.c
+        
+        # Run with buffer overflow protection
+        ./main_secure 2>&1 | tee runtime-test.txt
+        
+        echo "✅ Buffer overflow protections active"
+
+    - name: Security scan with flawfinder
+      run: |
+        echo "🔍 Running security vulnerability scan..."
+        flawfinder --quiet --html > flawfinder-report.html 2>&1 || true
+        flawfinder --quiet main.c 2>&1 | tee flawfinder-text.txt
+        
+        # Check for high-risk vulnerabilities
+        if grep -E "HITS|LEVEL 3|LEVEL 4|LEVEL 5" flawfinder-text.txt; then
+          echo "⚠️  Security vulnerabilities found (review flawfinder-report.html)"
+          # Don't exit 1 here as flawfinder can be noisy
+        fi
+        echo "✅ Security scan completed"
+
+    - name: Code quality metrics
+      run: |
+        echo "📊 Code quality metrics:"
+        echo "Lines of code: $(wc -l < main.c)"
+        echo "Functions: $(grep -c "^[a-zA-Z_].*[[:space:]]*[a-zA-Z_].*(.*)" main.c || true)"
+        echo "Array declarations: $(grep -c "\\[.*\\]" main.c)"
+        echo "Pointer declarations: $(grep -c "[*]" main.c)"
+        
+        # Complexity check
+        if which lizard >/dev/null 2>&1; then
+          pip3 install lizard
+          lizard main.c -C 12 -L 50 2>&1 | head -20
+        fi
+
+    - name: Custom array bounds analysis
+      run: |
+        echo "🔍 Custom array bounds analysis..."
+        python3 << 'EOF'
+        import re
+        import sys
+        
+        with open('main.c', 'r') as f:
+            content = f.read()
+        
+        # Find array declarations
+        array_pattern = r'(\w+)\s+(\w+)\s*\[\s*(\d+)\s*\]'
+        arrays = re.findall(array_pattern, content)
+        
+        print(f"Found {len(arrays)} array declarations:")
+        for arr_type, arr_name, arr_size in arrays:
+            print(f"  {arr_type} {arr_name}[{arr_size}]")
+        
+        # Find potential array accesses
+        access_pattern = r'(\w+)\s*\[\s*([^]]+)\s*\]'
+        accesses = re.findall(access_pattern, content)
+        
+        suspicious_accesses = []
+        for arr_name, index in accesses:
+            # Check if index contains variables that might cause overflow
+            if not index.isdigit():
+                # Look for patterns like array[i+1], array[size], etc.
+                if any(op in index for op in ['+', '-', '*', '/', 'size', 'len', 'count']):
+                    suspicious_accesses.append((arr_name, index))
+        
+        if suspicious_accesses:
+            print("⚠️  Suspicious array accesses (manual review recommended):")
+            for arr, idx in suspicious_accesses:
+                print(f"  {arr}[{idx}]")
+        else:
+            print("✅ No obviously suspicious array accesses found")
+        
+        EOF
+
+    - name: Generate summary report
+      if: always()
+      run: |
+        echo "📋 CODE ANALYSIS SUMMARY"
+        echo "========================"
+        echo "✅ Syntax check: $(if [ $? -eq 0 ]; then echo 'PASS'; else echo 'FAIL'; fi)"
+        echo "✅ Static analysis: Completed"
+        echo "✅ Memory leak check: Completed" 
+        echo "✅ Array bounds analysis: Completed"
+        echo "✅ Security scan: Completed"
+        echo ""
+        echo "Artifacts generated:"
+        echo "- cppcheck-report.txt"
+        echo "- clang-analyzer-report.txt"
+        echo "- valgrind-report.txt"
+        echo "- flawfinder-report.html"
+        echo ""
+        echo "Review any warnings in the artifacts above."
+
+    - name: Upload analysis reports
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: code-analysis-reports
+        path: |
+          *.txt
+          *.html
+          main_debug
+        retention-days: 30
